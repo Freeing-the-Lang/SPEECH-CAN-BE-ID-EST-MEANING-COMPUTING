@@ -1,0 +1,162 @@
+name: Speech-Meaning Computing Auto Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: speech-meaning-release
+  cancel-in-progress: false
+
+jobs:
+  # ============================================
+  # Generate Version Tag + Check Duplicate
+  # ============================================
+  versioning:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate version tag
+        id: tag
+        run: |
+          DATE=$(date +"%Y%m%d%H%M")
+          TAG="speech-meaning-${DATE}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          T=${{ steps.tag.outputs.tag }}
+          EXIST=$(gh release view "$T" --json tagName --jq ".tagName" 2>/dev/null || true)
+          if [ "$EXIST" = "$T" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ============================================
+  # Build for 3 OS
+  # ============================================
+  build:
+    needs: versioning
+    if: needs.versioning.outputs.exists == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo build
+        run: cargo build --release
+
+      # ----------------------------------------
+      # Proof files
+      # ----------------------------------------
+      - name: Prepare ProofLedger
+        run: |
+          mkdir -p proof
+          echo "Speech → ID → EST → Meaning Computing Proof" > proof/PROOF-${{ matrix.os }}.txt
+          echo "Tag: ${{ needs.versioning.outputs.tag }}" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "Commit: $GITHUB_SHA" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "OS: ${{ matrix.os }}" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "BuildTime: $(date)" >> proof/PROOF-${{ matrix.os }}.txt
+
+      # ----------------------------------------
+      # SHA256 - Unix
+      # ----------------------------------------
+      - name: Generate SHA256 (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "SHA256 Checksums" > proof/SHA256-${{ matrix.os }}.txt
+          find target/release -maxdepth 1 -type f -exec sha256sum {} \; >> proof/SHA256-${{ matrix.os }}.txt
+
+      # ----------------------------------------
+      # SHA256 - Windows
+      # ----------------------------------------
+      - name: Generate SHA256 (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Set-Location target/release
+          $files = Get-ChildItem -File
+          $output = "../../proof/SHA256-windows.txt"
+          "SHA256 Checksums (Windows)" | Out-File $output -Encoding utf8
+          foreach ($f in $files) {
+              $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+              "$h  $($f.Name)" | Out-File $output -Append -Encoding utf8
+          }
+
+      # ----------------------------------------
+      # Collect output
+      # ----------------------------------------
+      - name: Collect build outputs
+        run: |
+          mkdir -p out
+          cp -r target/release out/
+          cp -r proof out/
+          cp README.md out/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-meaning-${{ matrix.os }}
+          path: out/
+
+  # ============================================
+  # Create Release
+  # ============================================
+  release:
+    needs: [versioning, build]
+    if: needs.versioning.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.versioning.outputs.tag }}
+          name: "Speech → Meaning Computing Release — ${{ needs.versioning.outputs.tag }}"
+          body: |
+            ## Speech → ID → EST → Meaning Computing
+            의미 기반 음성 컴퓨팅 엔진 자동 릴리즈입니다.
+
+            - Speech → Identification → Essence → Meaning → Execution
+            - MultiMain-OS / Spongelang 연동 가능
+            - 3 OS 자동 빌드 완료
+            - ProofLedger + SHA256 포함
+
+          files: release/**
+
+  # ============================================
+  # Skip Release When Tag Exists
+  # ============================================
+  skip:
+    needs: versioning
+    if: needs.versioning.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: echo "Tag already exists → Release skipped" >> $GITHUB_STEP_SUMMARY
